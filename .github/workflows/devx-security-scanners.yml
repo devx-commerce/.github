@@ -1,0 +1,547 @@
+name: devx Security Scanners
+
+on:
+  workflow_call:
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: /tmp/trivy-cache
+          key: trivy-db-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: trivy-db-${{ runner.os }}-
+
+      - name: Install Trivy v0.69.3
+        run: |
+          TRIVY_VERSION="0.69.3"
+          ARCHIVE="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          EXPECTED="1816b632dfe529869c740c0913e36bd1629cb7688bd5634f4a858c1d57c88b75"
+          wget -q "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${ARCHIVE}"
+          echo "${EXPECTED}  ${ARCHIVE}" | sha256sum -c
+          tar -xzf "${ARCHIVE}" trivy
+          sudo mv trivy /usr/local/bin/trivy
+
+      - name: Install TruffleHog
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Install Semgrep
+        run: pip install semgrep -q
+
+      - name: Run Trivy
+        continue-on-error: true
+        run: |
+          trivy fs . \
+            --format json \
+            --output trivy-output.json \
+            --severity HIGH,CRITICAL \
+            --cache-dir /tmp/trivy-cache \
+            --exit-code 0
+
+      - name: Run TruffleHog
+        run: |
+          trufflehog git file://. --json --no-update 2>/dev/null \
+            > trufflehog-output.json || true
+
+      - name: Run Semgrep
+        continue-on-error: true
+        run: |
+          semgrep scan \
+            --config auto \
+            --json \
+            --output semgrep-output.json \
+            . 2>/dev/null || true
+
+      - name: Build reports
+        run: |
+          python3 << 'PYEOF'
+          import json
+
+          NOISY = {"URI", "GenericApiKey"}
+
+          def norm_sev(s):
+              s = (s or "").upper()
+              if s == "ERROR":   return "HIGH"
+              if s == "WARNING": return "MEDIUM"
+              return s
+
+          # --- Trivy ---
+          out = ["# Trivy - Dependency CVEs\n"]
+          try:
+              data = json.load(open("trivy-output.json"))
+              findings = []
+              for result in data.get("Results", []):
+                  for v in result.get("Vulnerabilities", []) or []:
+                      findings.append({
+                          "sev":       v.get("Severity", "UNKNOWN"),
+                          "pkg":       v.get("PkgName", "?"),
+                          "installed": v.get("InstalledVersion", "?"),
+                          "fixed":     v.get("FixedVersion") or "No fix yet",
+                          "cve":       v.get("VulnerabilityID", ""),
+                          "title":     v.get("Title") or v.get("VulnerabilityID", ""),
+                          "file":      result.get("Target", ""),
+                      })
+              if not findings:
+                  out.append("No CRITICAL or HIGH vulnerabilities found.\n")
+              else:
+                  out.append(f"**{len(findings)} finding(s)**\n")
+                  for f in findings:
+                      out.append(f"### [{f['sev']}] {f['pkg']} - {f['title']}")
+                      out.append(f"- **CVE:** {f['cve']}")
+                      out.append(f"- **Installed:** `{f['installed']}`")
+                      out.append(f"- **Fix:** `{f['fixed']}`")
+                      out.append(f"- **File:** `{f['file']}`\n")
+          except Exception as e:
+              out.append(f"Error: {e}\n")
+          open("trivy-report.md", "w").write("\n".join(out))
+
+          # --- TruffleHog ---
+          out = ["# TruffleHog - Secret Scanning\n"]
+          findings = []
+          try:
+              for line in open("trufflehog-output.json"):
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      f = json.loads(line)
+                      if f.get("DetectorName") not in NOISY:
+                          findings.append(f)
+                  except Exception:
+                      pass
+          except FileNotFoundError:
+              pass
+          if not findings:
+              out.append("No secrets found.\n")
+          else:
+              out.append(f"**{len(findings)} secret(s) found - rotate immediately**\n")
+              for f in findings:
+                  src  = f.get("SourceMetadata", {}).get("Data", {})
+                  info = src.get("Git", {}) or src.get("Filesystem", {})
+                  verified = f.get("Verified", False)
+                  out.append(f"### [{'CRITICAL' if verified else 'HIGH'}] {f.get('DetectorName', 'Unknown')} Secret")
+                  out.append(f"- **File:** `{info.get('file', 'unknown')}`")
+                  if info.get("line"):
+                      out.append(f"- **Line:** {info['line']}")
+                  out.append(f"- **Verified:** {'Yes - actively usable' if verified else 'Potential match'}\n")
+          open("trufflehog-report.md", "w").write("\n".join(out))
+
+          # --- Semgrep ---
+          out = ["# Semgrep - Code Security Issues\n"]
+          try:
+              data = json.load(open("semgrep-output.json"))
+              results = [
+                  r for r in data.get("results", [])
+                  if norm_sev(r.get("extra", {}).get("severity", "")) not in ("INFO", "LOW")
+              ]
+              if not results:
+                  out.append("No security issues found.\n")
+              else:
+                  out.append(f"**{len(results)} finding(s)**\n")
+                  for r in results:
+                      sev = norm_sev(r.get("extra", {}).get("severity", "UNKNOWN"))
+                      out.append(f"### [{sev}] {r['check_id']}")
+                      out.append(f"- **File:** `{r['path']}:{r['start']['line']}`")
+                      out.append(f"- **Issue:** {r.get('extra', {}).get('message', '')[:300]}\n")
+          except Exception as e:
+              out.append(f"Error: {e}\n")
+          open("semgrep-report.md", "w").write("\n".join(out))
+          PYEOF
+
+      - name: PR comment and Check Run
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const workspace = process.env.GITHUB_WORKSPACE || '';
+            const NOISY = new Set(['URI', 'GenericApiKey']);
+
+            function relPath(p) {
+              if (!p) return '';
+              if (workspace && p.startsWith(workspace)) p = p.slice(workspace.length).replace(/^\//, '');
+              return p.replace(/^\.\//, '');
+            }
+
+            function normSev(s) {
+              s = (s || '').toUpperCase();
+              if (s === 'ERROR')   return 'HIGH';
+              if (s === 'WARNING') return 'MEDIUM';
+              return s;
+            }
+
+            const annotations = [];
+
+            if (fs.existsSync('semgrep-output.json')) {
+              try {
+                const data = JSON.parse(fs.readFileSync('semgrep-output.json', 'utf8'));
+                for (const r of (data.results || [])) {
+                  const sev = normSev(r.extra?.severity || 'WARNING');
+                  if (['INFO', 'LOW'].includes(sev)) continue;
+                  annotations.push({
+                    path:             relPath(r.path),
+                    start_line:       r.start.line,
+                    end_line:         r.end?.line || r.start.line,
+                    annotation_level: ['CRITICAL', 'HIGH'].includes(sev) ? 'failure' : 'warning',
+                    title:            r.check_id,
+                    message:          (r.extra?.message || r.check_id).slice(0, 1000),
+                  });
+                }
+              } catch (e) {}
+            }
+
+            if (fs.existsSync('trufflehog-output.json')) {
+              for (const line of fs.readFileSync('trufflehog-output.json', 'utf8').split('\n')) {
+                if (!line.trim()) continue;
+                try {
+                  const f = JSON.parse(line);
+                  if (!f.DetectorName || NOISY.has(f.DetectorName)) continue;
+                  const info = f.SourceMetadata?.Data?.Git || f.SourceMetadata?.Data?.Filesystem || {};
+                  const filePath = relPath(info.file || info.filename || '');
+                  if (filePath) {
+                    annotations.push({
+                      path:             filePath,
+                      start_line:       info.line || 1,
+                      end_line:         info.line || 1,
+                      annotation_level: 'failure',
+                      title:            `Secret: ${f.DetectorName}`,
+                      message:          `A ${f.DetectorName} credential was found. Remove it and rotate immediately.`,
+                    });
+                  }
+                } catch (e) {}
+              }
+            }
+
+            const read = (f) => fs.existsSync(f) ? fs.readFileSync(f, 'utf8').trim() : 'No output.';
+            const trivy      = read('trivy-report.md');
+            const trufflehog = read('trufflehog-report.md');
+            const semgrep    = read('semgrep-report.md');
+
+            const hasSecrets  = /secret\(s\) found/.test(trufflehog)  && !/No secrets/.test(trufflehog);
+            const hasCVEs     = /finding\(s\)/.test(trivy)            && !/No CRITICAL/.test(trivy);
+            const hasSAST     = /finding\(s\)/.test(semgrep)          && !/No security/.test(semgrep);
+            const hasBlocking = hasSecrets || hasCVEs || hasSAST;
+
+            const statusMsg = hasBlocking
+              ? '**Security issues found - review before merging.**'
+              : 'All security scans passed.';
+
+            const commentBody = [
+              '## devx Security Scan',
+              '',
+              statusMsg,
+              '',
+              '<details>',
+              '<summary>Trivy - Dependency CVEs</summary>',
+              '',
+              trivy.slice(0, 8000),
+              '',
+              '</details>',
+              '',
+              '<details>',
+              '<summary>TruffleHog - Secret Scanning</summary>',
+              '',
+              trufflehog.slice(0, 4000),
+              '',
+              '</details>',
+              '',
+              '<details>',
+              '<summary>Semgrep - Code Patterns</summary>',
+              '',
+              semgrep.slice(0, 8000),
+              '',
+              '</details>',
+            ].join('\n');
+
+            if (context.payload.pull_request) {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+              });
+              const existing = comments.find(c => c.body.includes('devx Security Scan'));
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner:      context.repo.owner,
+                  repo:       context.repo.repo,
+                  comment_id: existing.id,
+                  body:       commentBody,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner:        context.repo.owner,
+                  repo:         context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  body:         commentBody,
+                });
+              }
+            }
+
+            const headSha      = context.payload.pull_request?.head?.sha || context.sha;
+            const BATCH        = 50;
+            const checkTitle   = hasBlocking
+              ? `Security issues found${annotations.length > 0 ? ` - ${annotations.length} annotation(s)` : ''}`
+              : 'All scans passed';
+            const checkSummary = `${statusMsg}${annotations.length > 0 ? `\n\n${annotations.length} finding(s) annotated inline on the diff.` : ''}`;
+
+            const check = await github.rest.checks.create({
+              owner:      context.repo.owner,
+              repo:       context.repo.repo,
+              name:       'devx Security Scan',
+              head_sha:   headSha,
+              status:     'completed',
+              conclusion: hasBlocking ? 'failure' : 'success',
+              output: { title: checkTitle, summary: checkSummary, annotations: annotations.slice(0, BATCH) },
+            });
+
+            for (let i = BATCH; i < annotations.length; i += BATCH) {
+              await github.rest.checks.update({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                check_run_id: check.data.id,
+                output: { title: checkTitle, summary: checkSummary, annotations: annotations.slice(i, i + BATCH) },
+              });
+            }
+
+            if (hasBlocking) core.setFailed('Security issues found. Review findings before merging.');
+
+      - name: Step Summary
+        if: always()
+        run: |
+          {
+            echo "## devx Security Scan Results"
+            echo ""
+            echo "### Trivy - Dependency CVEs"
+            [ -f trivy-report.md ]      && cat trivy-report.md      || echo "No output."
+            echo ""
+            echo "### TruffleHog - Secret Scanning"
+            [ -f trufflehog-report.md ] && cat trufflehog-report.md || echo "No output."
+            echo ""
+            echo "### Semgrep - Code Patterns"
+            [ -f semgrep-report.md ]    && cat semgrep-report.md    || echo "No output."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sync issues
+        if: always() && github.ref == 'refs/heads/main'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const NOISY   = new Set(['URI', 'GenericApiKey']);
+            const TRACKER = 'scanner-tracked';
+            const RUN_URL = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const NOW     = new Date().toUTCString();
+            const repo    = { owner: context.repo.owner, repo: context.repo.repo };
+
+            function normSev(s) {
+              s = (s || '').toUpperCase();
+              if (s === 'ERROR')   return 'HIGH';
+              if (s === 'WARNING') return 'MEDIUM';
+              return s;
+            }
+
+            function sevDescription(sev) {
+              switch (normSev(sev)) {
+                case 'CRITICAL': return 'Critical (remote code execution, credential exposure, data breach)';
+                case 'HIGH':     return 'High (auth bypass, privilege escalation, significant data exposure)';
+                case 'MEDIUM':   return 'Medium (limited data exposure, requires user interaction)';
+                default:         return 'Low (informational, hardening improvement)';
+              }
+            }
+
+            function vulnType(tool, ruleId) {
+              if (tool === 'TruffleHog') return 'Hardcoded secret / credential';
+              if (tool === 'Trivy')      return 'Dependency CVE';
+              const r = (ruleId || '').toLowerCase();
+              if (r.includes('inject') || r.includes('child-process') || r.includes('shell')) return 'Injection (SQL, command, shell)';
+              if (r.includes('secret') || r.includes('token') || r.includes('key'))           return 'Hardcoded secret / credential';
+              if (r.includes('xss')    || r.includes('sanitiz'))                              return 'XSS / CSRF';
+              if (r.includes('traversal') || r.includes('path-join'))                         return 'Path traversal';
+              if (r.includes('tls')    || r.includes('ssl'))                                  return 'Insecure configuration';
+              return 'Other';
+            }
+
+            const REQUIRED_LABELS = [
+              { name: 'security',        color: 'd93f0b', description: 'Security finding' },
+              { name: 'scanner-tracked', color: '0075ca', description: 'Auto-managed by devx security scanner' },
+              { name: 'critical',        color: 'b60205', description: 'Critical severity' },
+              { name: 'high',            color: 'e4e669', description: 'High severity' },
+              { name: 'medium',          color: 'fbca04', description: 'Medium severity' },
+              { name: 'low',             color: '0e8a16', description: 'Low severity' },
+            ];
+            for (const label of REQUIRED_LABELS) {
+              try { await github.rest.issues.createLabel({ ...repo, ...label }); } catch (e) { /* 422 = already exists */ }
+            }
+
+            const findings = [];
+
+            if (fs.existsSync('semgrep-output.json')) {
+              try {
+                const data = JSON.parse(fs.readFileSync('semgrep-output.json', 'utf8'));
+                for (const r of (data.results || [])) {
+                  const sev = normSev(r.extra?.severity || 'WARNING');
+                  if (['INFO', 'LOW'].includes(sev)) continue;
+                  findings.push({
+                    tool:     'Semgrep',
+                    rule_id:  r.check_id,
+                    file:     r.path,
+                    line:     r.start?.line || null,
+                    severity: sev,
+                    message:  (r.extra?.message || r.check_id).slice(0, 500),
+                  });
+                }
+              } catch (e) { console.log('Semgrep parse error:', e.message); }
+            }
+
+            if (fs.existsSync('trufflehog-output.json')) {
+              const workspace = process.env.GITHUB_WORKSPACE || '';
+              for (const line of fs.readFileSync('trufflehog-output.json', 'utf8').split('\n')) {
+                if (!line.trim()) continue;
+                try {
+                  const f = JSON.parse(line);
+                  if (!f.DetectorName || NOISY.has(f.DetectorName)) continue;
+                  const info = f.SourceMetadata?.Data?.Git || f.SourceMetadata?.Data?.Filesystem || {};
+                  let file = info.file || info.filename || 'unknown';
+                  if (workspace && file.startsWith(workspace)) file = file.slice(workspace.length).replace(/^\//, '');
+                  findings.push({
+                    tool:     'TruffleHog',
+                    rule_id:  f.DetectorName,
+                    file,
+                    line:     info.line || null,
+                    severity: f.Verified ? 'CRITICAL' : 'HIGH',
+                    message:  `A ${f.DetectorName} credential was found. Remove it and rotate immediately.`,
+                  });
+                } catch (e) {}
+              }
+            }
+
+            if (fs.existsSync('trivy-output.json')) {
+              try {
+                const data = JSON.parse(fs.readFileSync('trivy-output.json', 'utf8'));
+                for (const result of (data.Results || [])) {
+                  for (const v of (result.Vulnerabilities || [])) {
+                    const sev = (v.Severity || 'UNKNOWN').toUpperCase();
+                    if (!['CRITICAL', 'HIGH'].includes(sev)) continue;
+                    findings.push({
+                      tool:     'Trivy',
+                      rule_id:  v.VulnerabilityID,
+                      file:     result.Target,
+                      line:     null,
+                      severity: sev,
+                      message:  `${v.PkgName} v${v.InstalledVersion}: ${v.Title || v.VulnerabilityID}. Fix: ${v.FixedVersion ? 'update to v' + v.FixedVersion : 'no fix available yet'}.`,
+                    });
+                  }
+                }
+              } catch (e) { console.log('Trivy parse error:', e.message); }
+            }
+
+            let openIssues = [];
+            let cursor = null;
+            do {
+              const result = await github.graphql(`
+                query($owner: String!, $repo: String!, $cursor: String) {
+                  repository(owner: $owner, name: $repo) {
+                    issues(first: 100, after: $cursor, states: [OPEN], filterBy: {labels: ["scanner-tracked"]}) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { number title }
+                    }
+                  }
+                }
+              `, { owner: repo.owner, repo: repo.repo, cursor });
+              const page = result.repository.issues;
+              openIssues = openIssues.concat(page.nodes);
+              cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+            } while (cursor);
+            console.log(`Found ${openIssues.length} open scanner-tracked issues`);
+
+            const seenTitles     = new Set();
+            const createdThisRun = new Set();
+
+            for (const f of findings) {
+              const loc   = f.line ? `${f.file}:${f.line}` : f.file;
+              const title = `[${f.severity}] ${f.rule_id}: ${loc}`;
+              seenTitles.add(title);
+
+              if (createdThisRun.has(title)) continue;
+              createdThisRun.add(title);
+
+              const branchSuffix = f.rule_id.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase().slice(0, 50);
+
+              const body = [
+                `**Severity:** ${sevDescription(f.severity)}`,
+                `**Vulnerability Type:** ${vulnType(f.tool, f.rule_id)}`,
+                `**Affected File:** \`${loc}\``,
+                `**Description:** ${f.message}`,
+                `**Detected By:** ${f.tool}`,
+                ``,
+                `---`,
+                `## How to fix`,
+                ``,
+                `1. Click **"Create a branch"** in the sidebar (suggested name: \`fix/security-${branchSuffix}\`)`,
+                `2. Fix the issue in \`${loc}\``,
+                `3. Open a PR with \`Closes #<this-issue-number>\` in the description - merging auto-closes this issue`,
+                `4. The next scanner run confirms the fix is resolved`,
+                ``,
+                `---`,
+                `*Auto-created by devx security scanner. [View run](${RUN_URL})*`,
+              ].join('\n');
+
+              const existing = openIssues.find(i => i.title === title);
+
+              if (!existing) {
+                await github.rest.issues.create({
+                  ...repo,
+                  title,
+                  body,
+                  labels:    ['security', 'bug', TRACKER, f.severity.toLowerCase()],
+                  assignees: [context.actor],
+                });
+                console.log(`Created: ${title}`);
+              } else {
+                await github.rest.issues.createComment({
+                  ...repo,
+                  issue_number: existing.number,
+                  body: `Still present as of ${NOW}. [View run](${RUN_URL})`,
+                });
+                console.log(`Still present: #${existing.number}`);
+              }
+            }
+
+            for (const issue of openIssues) {
+              if (!seenTitles.has(issue.title)) {
+                await github.rest.issues.createComment({
+                  ...repo,
+                  issue_number: issue.number,
+                  body: `Finding no longer detected as of ${NOW}. Closing automatically. [View run](${RUN_URL})`,
+                });
+                await github.rest.issues.update({ ...repo, issue_number: issue.number, state: 'closed' });
+                console.log(`Auto-closed: #${issue.number}`);
+              }
+            }
+
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-${{ github.run_id }}
+          path: |
+            trivy-report.md
+            trufflehog-report.md
+            semgrep-report.md
+          retention-days: 90
