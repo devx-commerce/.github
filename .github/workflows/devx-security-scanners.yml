@@ -596,6 +596,98 @@ jobs:
               }
             }
 
+      - name: Generate GitHub App token
+        id: app-token
+        if: github.ref_name == github.event.repository.default_branch
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DEVX_APP_ID }}
+          private-key: ${{ secrets.DEVX_APP_PRIVATE_KEY }}
+          owner: devx-commerce
+
+      - name: Sync issues to GitHub Project
+        if: github.ref_name == github.event.repository.default_branch && steps.app-token.outputs.token != ''
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const PROJECT_ID    = 'PVT_kwDOCiGJ0s4BW-gG';
+            const SEV_FIELD_ID  = 'PVTSSF_lADOCiGJ0s4BW-gGzhSOq6s';
+            const SCAN_FIELD_ID = 'PVTSSF_lADOCiGJ0s4BW-gGzhSOq9U';
+
+            const SEV_OPTIONS  = { critical: 'c780f529', high: 'acba09fb', medium: '34424660', low: '2565e41c' };
+            const SCAN_OPTIONS = { Trivy: 'da40f31b', TruffleHog: 'a51c5c72', Semgrep: '8819626d' };
+
+            function detectScanner(title) {
+              if (/CVE-\d{4}-\d+/.test(title))    return 'Trivy';
+              if (/\.(lang|security|audit)\./.test(title) || title.split('] ')[1]?.includes('.')) return 'Semgrep';
+              return 'TruffleHog';
+            }
+
+            // Fetch all open scanner-tracked issues in this repo
+            let issues = [], cursor = null;
+            do {
+              const result = await github.graphql(`
+                query($owner: String!, $repo: String!, $cursor: String) {
+                  repository(owner: $owner, name: $repo) {
+                    issues(first: 100, after: $cursor, states: [OPEN], filterBy: {labels: ["scanner-tracked"]}) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { id title labels(first: 10) { nodes { name } } }
+                    }
+                  }
+                }
+              `, { owner: context.repo.owner, repo: context.repo.repo, cursor });
+              const page = result.repository.issues;
+              issues = issues.concat(page.nodes);
+              cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+            } while (cursor);
+
+            console.log(`Syncing ${issues.length} issues to project`);
+
+            for (const issue of issues) {
+              // Add to project (idempotent - returns existing item if already added)
+              const added = await github.graphql(`
+                mutation($projectId: ID!, $contentId: ID!) {
+                  addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+                    item { id }
+                  }
+                }
+              `, { projectId: PROJECT_ID, contentId: issue.id });
+
+              const itemId = added.addProjectV2ItemById.item.id;
+
+              const labels  = issue.labels.nodes.map(l => l.name.toLowerCase());
+              const sev     = ['critical', 'high', 'medium', 'low'].find(s => labels.includes(s));
+              const scanner = detectScanner(issue.title);
+
+              // Set Severity field
+              if (sev && SEV_OPTIONS[sev]) {
+                await github.graphql(`
+                  mutation($p: ID!, $i: ID!, $f: ID!, $v: String!) {
+                    updateProjectV2ItemFieldValue(input: {
+                      projectId: $p, itemId: $i, fieldId: $f,
+                      value: { singleSelectOptionId: $v }
+                    }) { projectV2Item { id } }
+                  }
+                `, { p: PROJECT_ID, i: itemId, f: SEV_FIELD_ID, v: SEV_OPTIONS[sev] });
+              }
+
+              // Set Scanner field
+              if (SCAN_OPTIONS[scanner]) {
+                await github.graphql(`
+                  mutation($p: ID!, $i: ID!, $f: ID!, $v: String!) {
+                    updateProjectV2ItemFieldValue(input: {
+                      projectId: $p, itemId: $i, fieldId: $f,
+                      value: { singleSelectOptionId: $v }
+                    }) { projectV2Item { id } }
+                  }
+                `, { p: PROJECT_ID, i: itemId, f: SCAN_FIELD_ID, v: SCAN_OPTIONS[scanner] });
+              }
+
+              console.log(`Synced: ${issue.title} → sev=${sev}, scanner=${scanner}`);
+            }
+
       - name: Upload scan artifacts
         if: always()
         uses: actions/upload-artifact@v4
