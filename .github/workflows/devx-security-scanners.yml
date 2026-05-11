@@ -602,7 +602,7 @@ jobs:
         continue-on-error: true
         uses: actions/create-github-app-token@v1
         with:
-          app-id: ${{ secrets.DEVX_APP_ID }}
+          app-id: '3672957'
           private-key: ${{ secrets.DEVX_APP_PRIVATE_KEY }}
           owner: devx-commerce
 
