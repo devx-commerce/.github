@@ -500,24 +500,36 @@ jobs:
               } catch (e) { console.log('Trivy parse error:', e.message); }
             }
 
-            let openIssues = [];
+            // openIssues      = scanner-tracked issues only (used for auto-close)
+            // allOpenByTitle  = ALL open issues by title (used for dedup - survives label loss)
+            let openIssues     = [];
+            let allOpenByTitle = new Map();
             let cursor = null;
             do {
               const result = await github.graphql(`
                 query($owner: String!, $repo: String!, $cursor: String) {
                   repository(owner: $owner, name: $repo) {
-                    issues(first: 100, after: $cursor, states: [OPEN], filterBy: {labels: ["scanner-tracked"]}) {
+                    issues(first: 100, after: $cursor, states: [OPEN]) {
                       pageInfo { hasNextPage endCursor }
-                      nodes { number title }
+                      nodes {
+                        number
+                        title
+                        labels(first: 10) { nodes { name } }
+                      }
                     }
                   }
                 }
               `, { owner: repo.owner, repo: repo.repo, cursor });
               const page = result.repository.issues;
-              openIssues = openIssues.concat(page.nodes);
+              for (const node of page.nodes) {
+                allOpenByTitle.set(node.title, node.number);
+                if (node.labels.nodes.some(l => l.name === TRACKER)) {
+                  openIssues.push({ number: node.number, title: node.title });
+                }
+              }
               cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
             } while (cursor);
-            console.log(`Found ${openIssues.length} open scanner-tracked issues`);
+            console.log(`Found ${openIssues.length} open scanner-tracked issues, ${allOpenByTitle.size} open issues total`);
 
             const seenTitles     = new Set();
             const createdThisRun = new Set();
@@ -551,9 +563,9 @@ jobs:
                 `*Auto-created by devx security scanner. [View run](${RUN_URL})*`,
               ].join('\n');
 
-              const existing = openIssues.find(i => i.title === title);
+              const existingNumber = allOpenByTitle.get(title);
 
-              if (!existing) {
+              if (!existingNumber) {
                 await github.rest.issues.create({
                   ...repo,
                   title,
@@ -565,10 +577,10 @@ jobs:
               } else {
                 await github.rest.issues.createComment({
                   ...repo,
-                  issue_number: existing.number,
+                  issue_number: existingNumber,
                   body: `Still present as of ${NOW}. [View run](${RUN_URL})`,
                 });
-                console.log(`Still present: #${existing.number}`);
+                console.log(`Still present: #${existingNumber}`);
               }
             }
 
