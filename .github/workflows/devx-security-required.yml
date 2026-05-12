@@ -1,0 +1,14 @@
+name: devx Security Scan (Required)
+
+on:
+  pull_request:
+
+jobs:
+  security:
+    uses: devx-commerce/.github/.github/workflows/devx-security-scanners.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: write
+      issues: write
+
