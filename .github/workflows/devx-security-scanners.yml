@@ -120,15 +120,55 @@ jobs:
       - name: Build reports
         run: |
           python3 << 'PYEOF'
-          import json
+          import json, os
 
-          NOISY = {"URI", "GenericApiKey"}
+          NOISY     = {"URI", "GenericApiKey"}
+          GH_SERVER = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+          GH_REPO   = os.environ.get("GITHUB_REPOSITORY", "")
+          GH_SHA    = os.environ.get("GITHUB_SHA", "HEAD")
+          WORKSPACE = os.environ.get("GITHUB_WORKSPACE", "")
 
           def norm_sev(s):
               s = (s or "").upper()
               if s == "ERROR":   return "HIGH"
               if s == "WARNING": return "MEDIUM"
               return s
+
+          def norm_path(p):
+              if WORKSPACE and p.startswith(WORKSPACE):
+                  p = p[len(WORKSPACE):].lstrip("/")
+              return p.lstrip("./")
+
+          def gh_link(path, line=None):
+              p = norm_path(path)
+              fragment = f"#L{line}" if line else ""
+              return f"{GH_SERVER}/{GH_REPO}/blob/{GH_SHA}/{p}{fragment}"
+
+          def snippet(path, line, context=2):
+              try:
+                  p = norm_path(path)
+                  with open(p) as fh:
+                      lines = fh.readlines()
+                  start = max(0, line - context - 1)
+                  end   = min(len(lines), line + context)
+                  rows  = []
+                  for i, l in enumerate(lines[start:end], start=start + 1):
+                      marker = ">" if i == line else " "
+                      rows.append(f"{marker} {i:4d} | {l.rstrip()}")
+                  return "\n".join(rows)
+              except Exception:
+                  return ""
+
+          def redact(path, line):
+              try:
+                  p = norm_path(path)
+                  with open(p) as fh:
+                      raw = fh.readlines()[line - 1].rstrip()
+                  # Mask everything after = or : that looks like a value
+                  import re
+                  return re.sub(r'([:=]\s*["\']?)([A-Za-z0-9+/=_\-]{6,})', lambda m: m.group(1) + m.group(2)[:4] + "****", raw)
+              except Exception:
+                  return ""
 
           # --- Trivy ---
           out = ["# Trivy - Dependency CVEs\n"]
@@ -137,25 +177,33 @@ jobs:
               findings = []
               for result in data.get("Results", []):
                   for v in result.get("Vulnerabilities", []) or []:
+                      refs = v.get("References") or []
+                      nvd  = next((r for r in refs if "nvd.nist.gov" in r), refs[0] if refs else None)
                       findings.append({
                           "sev":       v.get("Severity", "UNKNOWN"),
                           "pkg":       v.get("PkgName", "?"),
+                          "pkg_path":  v.get("PkgPath", ""),
                           "installed": v.get("InstalledVersion", "?"),
                           "fixed":     v.get("FixedVersion") or "No fix yet",
                           "cve":       v.get("VulnerabilityID", ""),
                           "title":     v.get("Title") or v.get("VulnerabilityID", ""),
                           "file":      result.get("Target", ""),
+                          "nvd":       nvd,
                       })
               if not findings:
                   out.append("No CRITICAL or HIGH vulnerabilities found.\n")
               else:
                   out.append(f"**{len(findings)} finding(s)**\n")
                   for f in findings:
+                      file_link = gh_link(f["file"])
+                      cve_link  = f"[{f['cve']}]({f['nvd']})" if f["nvd"] else f['cve']
                       out.append(f"### [{f['sev']}] {f['pkg']} - {f['title']}")
-                      out.append(f"- **CVE:** {f['cve']}")
-                      out.append(f"- **Installed:** `{f['installed']}`")
-                      out.append(f"- **Fix:** `{f['fixed']}`")
-                      out.append(f"- **File:** `{f['file']}`\n")
+                      out.append(f"- **CVE:** {cve_link}")
+                      out.append(f"- **Installed:** `{f['installed']}` → **Fix:** `{f['fixed']}`")
+                      out.append(f"- **Manifest:** [{f['file']}]({file_link})")
+                      if f["pkg_path"]:
+                          out.append(f"- **Package path:** `{f['pkg_path']}`")
+                      out.append("")
           except Exception as e:
               out.append(f"Error: {e}\n")
           open("trivy-report.md", "w").write("\n".join(out))
@@ -181,14 +229,21 @@ jobs:
           else:
               out.append(f"**{len(findings)} secret(s) found - rotate immediately**\n")
               for f in findings:
-                  src  = f.get("SourceMetadata", {}).get("Data", {})
-                  info = src.get("Git", {}) or src.get("Filesystem", {})
+                  src      = f.get("SourceMetadata", {}).get("Data", {})
+                  info     = src.get("Filesystem", {}) or src.get("Git", {})
                   verified = f.get("Verified", False)
-                  out.append(f"### [{'CRITICAL' if verified else 'HIGH'}] {f.get('DetectorName', 'Unknown')} Secret")
-                  out.append(f"- **File:** `{info.get('file', 'unknown')}`")
-                  if info.get("line"):
-                      out.append(f"- **Line:** {info['line']}")
-                  out.append(f"- **Verified:** {'Yes - actively usable' if verified else 'Potential match'}\n")
+                  file_p   = info.get("file", "unknown")
+                  line_no  = info.get("line")
+                  sev      = "CRITICAL" if verified else "HIGH"
+                  out.append(f"### [{sev}] {f.get('DetectorName', 'Unknown')} Secret")
+                  out.append(f"- **Verified:** {'Yes - actively usable' if verified else 'Potential match'}")
+                  link = gh_link(file_p, line_no)
+                  out.append(f"- **Location:** [{norm_path(file_p)}{':' + str(line_no) if line_no else ''}]({link})")
+                  if line_no:
+                      redacted = redact(file_p, line_no)
+                      if redacted:
+                          out.append(f"- **Line (redacted):** `{redacted}`")
+                  out.append("")
           open("trufflehog-report.md", "w").write("\n".join(out))
 
           # --- Semgrep ---
@@ -204,10 +259,17 @@ jobs:
               else:
                   out.append(f"**{len(results)} finding(s)**\n")
                   for r in results:
-                      sev = norm_sev(r.get("extra", {}).get("severity", "UNKNOWN"))
+                      sev     = norm_sev(r.get("extra", {}).get("severity", "UNKNOWN"))
+                      path    = r["path"]
+                      line_no = r["start"]["line"]
+                      link    = gh_link(path, line_no)
+                      snip    = snippet(path, line_no)
                       out.append(f"### [{sev}] {r['check_id']}")
-                      out.append(f"- **File:** `{r['path']}:{r['start']['line']}`")
-                      out.append(f"- **Issue:** {r.get('extra', {}).get('message', '')[:300]}\n")
+                      out.append(f"- **Location:** [{norm_path(path)}:{line_no}]({link})")
+                      out.append(f"- **Issue:** {r.get('extra', {}).get('message', '')[:300]}")
+                      if snip:
+                          out.append(f"\n```\n{snip}\n```")
+                      out.append("")
           except Exception as e:
               out.append(f"Error: {e}\n")
           open("semgrep-report.md", "w").write("\n".join(out))
