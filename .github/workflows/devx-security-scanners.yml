@@ -105,7 +105,8 @@ jobs:
 
       - name: Run TruffleHog
         run: |
-          trufflehog filesystem . --json --no-update 2>/dev/null \
+          printf '.git\n*.tar.gz\n*.zip\n*.tar\ntrufflehog-output.json\ntrivy-output.json\nsemgrep-output.json\n' > .trufflehogignore
+          trufflehog filesystem . --json --no-update --exclude-paths .trufflehogignore 2>/dev/null \
             > trufflehog-output.json || true
 
       - name: Run Semgrep
