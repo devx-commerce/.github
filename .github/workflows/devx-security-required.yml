@@ -2,6 +2,9 @@ name: devx Security Scan (Required)
 
 on:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * 1'
 
 jobs:
   security:
