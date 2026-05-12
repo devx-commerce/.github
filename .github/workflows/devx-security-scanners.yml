@@ -105,7 +105,7 @@ jobs:
 
       - name: Run TruffleHog
         run: |
-          trufflehog git file://. --json --no-update 2>/dev/null \
+          trufflehog filesystem . --json --no-update 2>/dev/null \
             > trufflehog-output.json || true
 
       - name: Run Semgrep
