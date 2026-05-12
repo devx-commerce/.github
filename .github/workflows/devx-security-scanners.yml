@@ -10,7 +10,7 @@ jobs:
 
     steps:
       - name: Sync org files
-        if: github.ref_name == github.event.repository.default_branch
+        if: github.ref_name == github.event.repository.default_branch || contains(fromJSON('["main","master","prod","production"]'), github.base_ref)
         uses: actions/github-script@v7
         with:
           script: |
@@ -387,7 +387,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Sync issues
-        if: always() && (github.ref_name == github.event.repository.default_branch || github.base_ref == github.event.repository.default_branch)
+        if: always() && (github.ref_name == github.event.repository.default_branch || contains(fromJSON('["main","master","prod","production"]'), github.base_ref))
         uses: actions/github-script@v7
         with:
           script: |
@@ -598,7 +598,7 @@ jobs:
 
       - name: Generate GitHub App token
         id: app-token
-        if: always() && (github.ref_name == github.event.repository.default_branch || github.base_ref == github.event.repository.default_branch)
+        if: always() && (github.ref_name == github.event.repository.default_branch || contains(fromJSON('["main","master","prod","production"]'), github.base_ref))
         continue-on-error: true
         uses: actions/create-github-app-token@v1
         with:
@@ -607,7 +607,7 @@ jobs:
           owner: devx-commerce
 
       - name: Sync issues to GitHub Project
-        if: always() && (github.ref_name == github.event.repository.default_branch || github.base_ref == github.event.repository.default_branch) && steps.app-token.outputs.token != ''
+        if: always() && (github.ref_name == github.event.repository.default_branch || contains(fromJSON('["main","master","prod","production"]'), github.base_ref)) && steps.app-token.outputs.token != ''
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.app-token.outputs.token }}
